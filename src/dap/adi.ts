@@ -33,6 +33,10 @@ import { DEFAULT_CLOCK_FREQUENCY } from '../proxy/cmsis-dap';
  */
 const DEFAULT_WAIT_DELAY = 100;
 
+// auto-increment beyond 1kB (10 bits) is implementation defined, see:
+// https://developer.arm.com/documentation/ihi0031/a/The-Memory-Access-Port--MEM-AP-/MEM-AP-functions/Auto-incrementing-the-Transfer-Address-Register--TAR-
+const DEFAULT_AUTOINC_PAGESIZE = (1 << 10);
+
 /**
  * Arm Debug Interface class
  */
@@ -166,6 +170,18 @@ export class ADI implements DAP {
         });
     }
 
+    protected readMem8Command(register: number): DAPOperation[] {
+        return this.writeAPCommand(APRegister.CSW, CSWMask.VALUE | CSWMask.SIZE_8)
+        .concat(this.writeAPCommand(APRegister.TAR, register))
+        .concat(this.readAPCommand(APRegister.DRW));
+    }
+
+    protected writeMem8Command(register: number, value: number): DAPOperation[] {
+        return this.writeAPCommand(APRegister.CSW, CSWMask.VALUE | CSWMask.SIZE_8)
+        .concat(this.writeAPCommand(APRegister.TAR, register))
+        .concat(this.writeAPCommand(APRegister.DRW, value));
+    }
+
     protected readMem16Command(register: number): DAPOperation[] {
         return this.writeAPCommand(APRegister.CSW, CSWMask.VALUE | CSWMask.SIZE_16)
         .concat(this.writeAPCommand(APRegister.TAR, register))
@@ -296,13 +312,34 @@ export class ADI implements DAP {
     }
 
     /**
+     * Read an 8-bit word from a memory access port register
+     * @param register ID of register to read
+     * @returns Promise of register data
+     */
+    public async readMem8(register: number): Promise<number> {
+        const result = await this.proxy.transfer(this.readMem8Command(register));
+        return result[0] as number >> ((register & 0x03) << 3) & 0xFF;
+    }
+
+    /**
+     * Write an 8-bit word to a memory access port register
+     * @param register ID of register to write to
+     * @param value The value to write
+     * @returns Promise
+     */
+    public async writeMem8(register: number, value: number): Promise<void> {
+        value = value as number << ((register & 0x03) << 3);
+        await this.proxy.transfer(this.writeMem8Command(register, value));
+    }
+
+    /**
      * Read a 16-bit word from a memory access port register
      * @param register ID of register to read
      * @returns Promise of register data
      */
     public async readMem16(register: number): Promise<number> {
         const result = await this.proxy.transfer(this.readMem16Command(register));
-        return result[0];
+        return result[0] as number >> ((register & 0x02) << 3) & 0xFFFF;
     }
 
     /**
@@ -337,12 +374,12 @@ export class ADI implements DAP {
     }
 
     /**
-     * Read a block of 32-bit words from a memory access port register
+     * Read a sequence of 32-bit words from a memory access port register, without crossing TAR auto-increment boundaries
      * @param register ID of register to read from
      * @param count The count of values to read
      * @returns Promise of register data
      */
-    public async readBlock(register: number, count: number): Promise<Uint32Array> {
+    protected async readMem32Sequence(register: number, count: number): Promise<Uint32Array> {
         await this.transferSequence([
             this.writeAPCommand(APRegister.CSW, CSWMask.VALUE | CSWMask.SIZE_32),
             this.writeAPCommand(APRegister.TAR, register),
@@ -363,12 +400,12 @@ export class ADI implements DAP {
     }
 
     /**
-     * Write a block of 32-bit words to a memory access port register
+     * Write a sequence of 32-bit words to a memory access port register, without crossing TAR auto-increment boundaries
      * @param register ID of register to write to
      * @param values The values to write
      * @returns Promise
      */
-    public async writeBlock(register: number, values: Uint32Array): Promise<void> {
+    protected async writeMem32Sequence(register: number, values: Uint32Array): Promise<void> {
         await this.transferSequence([
             this.writeAPCommand(APRegister.CSW, CSWMask.VALUE | CSWMask.SIZE_32),
             this.writeAPCommand(APRegister.TAR, register),
@@ -380,6 +417,48 @@ export class ADI implements DAP {
             const chunk = values.slice(index, index + Math.floor(this.proxy.blockSize / 4));
             await this.proxy.transferBlock(DAPPort.ACCESS, APRegister.DRW, chunk);
             index += Math.floor(this.proxy.blockSize / 4);
+        }
+    }
+
+    /**
+     * Read a block of 32-bit words from a memory access port register
+     * @param register ID of register to read from
+     * @param count The count of values to read
+     * @returns Promise of register data
+     */
+    public async readBlock(register: number, count: number): Promise<Uint32Array> {
+        const results: Uint32Array[] = [];
+
+        // Split into reads that do not cross TAR autoincrement boundaries
+        let remainder = count;
+        while (remainder > 0) {
+            const nextPageOffset = DEFAULT_AUTOINC_PAGESIZE - (register % DEFAULT_AUTOINC_PAGESIZE);
+            const chunkSize = Math.min(remainder, nextPageOffset / 4);
+            const result = await this.readMem32Sequence(register, chunkSize);
+            results.push(result);
+            register += chunkSize * 4;
+            remainder -= chunkSize;
+        }
+
+        return this.concatTypedArray(results);
+    }
+
+    /**
+     * Write a block of 32-bit words to a memory access port register
+     * @param register ID of register to write to
+     * @param values The values to write
+     * @returns Promise
+     */
+    public async writeBlock(register: number, values: Uint32Array): Promise<void> {
+        // Split into writes that do not cross TAR autoincrement boundaries
+        let index = 0;
+        while (index < values.length) {
+            const nextPageOffset = DEFAULT_AUTOINC_PAGESIZE - (register % DEFAULT_AUTOINC_PAGESIZE);
+            const chunkSize = Math.min(values.length - index, nextPageOffset / 4);
+            const chunk = values.slice(index, index + chunkSize);
+            await this.writeMem32Sequence(register, chunk);
+            register += chunkSize * 4;
+            index += chunkSize;
         }
     }
 }
